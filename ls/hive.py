@@ -18,7 +18,6 @@ compression_settings="""
 """.format("org.apache.hadoop.io.compress.SnappyCodec")
 
 
-
 class HiveDropTable(luigi.hive.HiveQueryTask):
     tablename = luigi.Parameter()
     databasename = luigi.Parameter()
@@ -143,7 +142,7 @@ def HiveDailyPartitionedTable(tablename, daily_partition_column, creation_query,
                 print "  ##########################################################"
             return full_query
 
-    class HiveDailyTableBatchQuery(luigi.Task):
+    class HiveDailyTableBatchQuery(luigi.WrapperTask):
         date_interval = luigi.DateIntervalParameter()
         debug = luigi.BooleanParameter(False)
         skip_compress = luigi.BooleanParameter(False)
@@ -152,9 +151,6 @@ def HiveDailyPartitionedTable(tablename, daily_partition_column, creation_query,
         def requires(self):
             return [HiveDailyTableQuery(date=date, debug=self.debug, skip_compress=self.skip_compress, force_drop=self.force_drop) for date in self.date_interval]
         
-        def complete(self):
-            return False
-
     return HiveDailyTableBatchQuery
 
 
