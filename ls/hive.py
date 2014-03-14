@@ -1,6 +1,11 @@
 import luigi
 import luigi.hive
 
+import tempfile
+import shutil
+import os
+
+# This doesn't really belong here, but I'm mimicing an existing system where these are needed
 compression_settings="""
     set hive.exec.compress.output=true;
     set mapred.output.compress=true;
@@ -11,6 +16,7 @@ compression_settings="""
     set mapreduce.map.output.compress.codec={0};
     set mapred.map.output.compression.codec={0};
 """.format("org.apache.hadoop.io.compress.SnappyCodec")
+
 
 
 class HiveDropTable(luigi.hive.HiveQueryTask):
@@ -33,7 +39,7 @@ class HiveDropTable(luigi.hive.HiveQueryTask):
         return not super(HiveDropTable, self).complete()
 
 
-def HiveTableExists(tablename, creation_query, databasename="default", debug_default=False, force_drop_default=False):
+def HiveBasicTable(tablename, creation_query, databasename="default", debug_default=False, force_drop_default=False):
     """
     Utility template for creating a hive table if it doesn't exist yet.
     The creation string can either contain the database and table names directly
@@ -43,13 +49,13 @@ def HiveTableExists(tablename, creation_query, databasename="default", debug_def
       creation_query: The SQL to create the table
       databasename: Optional database name for the table, defaults to "default"
     Usage: 
-        class TableINeed(ls.hive.HiveTableExists("my_table", "create table {1}.{0} (blah string)", "my_db")):
+        class TableINeed(ls.hive.HiveBasicTable("my_table", "create table {1}.{0} (blah string)", "my_db")):
             pass
 
-        class OtherTableINeed(ls.hive.HiveTableExists("my_other_table", "create table {1}.{0} (foo string)")):
+        class OtherTableINeed(ls.hive.HiveBasicTable("my_other_table", "create table {1}.{0} (foo string)")):
             pass
 
-        class CTASExample(ls.hive.HiveTableExists("purchases_by_day", "create table {1}.{0} as select day, count(*) c from purchases group by day")):
+        class CTASExample(ls.hive.HiveBasicTable("purchases_by_day", "create table {1}.{0} as select day, count(*) c from purchases group by day")):
             pass
     """
 
@@ -97,7 +103,7 @@ def HiveDailyPartitionedTable(tablename, daily_partition_column, creation_query,
     Params:
       tablename: The table that will be created
       daily_partition_column: Column name for partitioning (day or something like that)
-      creation_query: The SQL to create the table, see HiveTableExists docs for more info
+      creation_query: The SQL to create the table, see HiveBasicTable docs for more info. For this use it should only create the table structure, not insert anything into it.
       insertion_query: The SQL select statement to use to fill each partition.  The string {0} will be set to the day
       databasename: Optional database name for the table, defaults to "default"
     Usage: 
@@ -115,7 +121,7 @@ def HiveDailyPartitionedTable(tablename, daily_partition_column, creation_query,
         force_drop = luigi.BooleanParameter(False, significant=False, description="USE WITH CAUTION, this will drop the table and rerun")
 
         def requires(self):
-            class MyTableExists(HiveTableExists(tablename, creation_query, databasename=databasename, debug_default=self.debug, force_drop_default=self.force_drop)):
+            class MyTableExists(HiveBasicTable(tablename, creation_query, databasename=databasename, debug_default=self.debug, force_drop_default=self.force_drop)):
                 pass
 
             return [MyTableExists()]
@@ -152,6 +158,94 @@ def HiveDailyPartitionedTable(tablename, daily_partition_column, creation_query,
     return HiveDailyTableBatchQuery
 
 
+def HiveExtract(local_output, extraction_query, merge_output=False, merge_separator="\t", default_debug=False):
+    """
+    Extract the results of a query to a local output location.
+
+    Params:
+      local_output: where the results will be saved
+      extraction_query: A SELECT... query.  The query results will be saved
+      merge_output: If true this will collapse the output to a single file and save that in the local_output location.  
+          If false the local_output will be a folder containing one or more files with the output.  Defaults to False
+      merge_separator: If merge_output is enabled the default hive separator of '\01' will be replaced with this.  
+          Defaults to a tab
+    """
+
+    class HiveDataExtraction(luigi.hive.HiveQueryTask):
+        debug = luigi.BooleanParameter(default_debug, significant=False)
+        tempdir = None
+
+        def get_tempdir(self):
+            if not self.tempdir:
+                self.tempdir = tempfile.mkdtemp()
+            return self.tempdir
+
+        def real_local_output(self):
+            return local_output
+
+        def query_output(self):
+            output = self.real_local_output()
+            if merge_output:
+                output = self.get_tempdir()
+            return output
+
+        def output(self):
+            return luigi.LocalTarget(self.real_local_output())
+
+        def run(self):
+            super(HiveDataExtraction, self).run()
+            if merge_output:
+                temp_output = self.query_output()
+                cmd = "cat {0}/0* | tr '\01' '{2}' > {1}".format(temp_output, self.output().path, merge_separator)
+                if self.debug:
+                    print "  ##########################################################"
+                    print cmd
+                    print "  ##########################################################"
+                os.system(cmd)
+                shutil.rmtree(temp_output)
+
+        def real_extraction_query(self):
+            return extraction_query
+
+        def query(self):
+            out = self.query_output()
+            a = "INSERT OVERWRITE LOCAL DIRECTORY '{0}' ".format(out)
+            full_query = a + "\n" + self.real_extraction_query()
+            if self.debug:
+                print "  ##########################################################"
+                print full_query
+                print "  ##########################################################"
+            return full_query
+ 
+
+    return HiveDataExtraction
+
+
+def HiveDateRangeExtract(local_output, extraction_query, merge_output=False, default_debug=False):
+    """
+    This operates the same as HiveExtract with a couple of differences:
+    - A --date-interval is required as input
+    - The local_output should have a {0} that will be replace with the interval
+    - The extraction query should have a {0} and {1} for the start and end dates.
+    Note: The start date is inclusive and the end date is exclusive so 
+    date >= {0} and date < {1} is the appropriate way to check the dates.
+    """
+
+    class HiveDateRangeExtraction(HiveExtract(local_output, None, merge_output=merge_output, default_debug=default_debug)):
+        date_interval = luigi.DateIntervalParameter()
+        debug = luigi.BooleanParameter(default_debug, significant=False)
+
+        def real_extraction_query(self):
+            q = extraction_query.format(self.date_interval.date_a, self.date_interval.date_b)
+            return q
+
+        def real_local_output(self):
+            return local_output.format(self.date_interval)
+
+    return HiveDateRangeExtraction
+
 
 if __name__ == '__main__':
     luigi.run()
+
+
